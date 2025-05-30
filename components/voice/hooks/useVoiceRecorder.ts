@@ -4,21 +4,21 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { 
-  VoiceConfig, 
-  VoiceRecordingState, 
+import {
+  VoiceConfig,
+  VoiceRecordingState,
   UseVoiceRecorderReturn,
-  VOICE_CONSTANTS 
+  VOICE_CONSTANTS
 } from '@/types/voice'
-import { 
-  getRecordingOptions, 
-  getBestAudioFormat 
+import {
+  getRecordingOptions,
+  getBestAudioFormat
 } from '@/lib/voice/config'
-import { 
-  handleMediaError, 
-  handleRecorderError, 
+import {
+  handleMediaError,
+  handleRecorderError,
   createVoiceError,
-  VOICE_ERROR_CODES 
+  VOICE_ERROR_CODES
 } from '@/lib/voice/errors'
 
 /**
@@ -126,16 +126,40 @@ export function useVoiceRecorder(config: VoiceConfig): UseVoiceRecorderReturn {
         )
       }
 
-      // 获取媒体流
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: config.sampleRate,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      })
+      // 获取媒体流，使用渐进式降级策略
+      let stream: MediaStream
+
+      try {
+        // 首先尝试高质量配置
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            sampleRate: config.sampleRate,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        })
+      } catch (constraintError) {
+        console.warn('High-quality audio constraints failed, trying basic:', constraintError)
+
+        // 如果高质量配置失败，尝试基本配置
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          })
+        } catch (basicError) {
+          console.warn('Basic audio constraints failed, trying minimal:', basicError)
+
+          // 最后尝试最小配置
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+          })
+        }
+      }
 
       mediaStreamRef.current = stream
 
@@ -143,23 +167,51 @@ export function useVoiceRecorder(config: VoiceConfig): UseVoiceRecorderReturn {
       try {
         const AudioContext = window.AudioContext || (window as any).webkitAudioContext
         audioContextRef.current = new AudioContext()
-        
+
         const source = audioContextRef.current.createMediaStreamSource(stream)
         const analyser = audioContextRef.current.createAnalyser()
-        
+
         analyser.fftSize = 256
         analyser.smoothingTimeConstant = 0.8
-        
+
         source.connect(analyser)
         analyserRef.current = analyser
       } catch (error) {
         console.warn('Failed to create audio context for visualization:', error)
       }
 
-      // 创建 MediaRecorder
-      const options = getRecordingOptions(config)
-      const mediaRecorder = new MediaRecorder(stream, options)
-      
+      // 创建 MediaRecorder，使用跨平台兼容的配置
+      let mediaRecorder: MediaRecorder
+
+      try {
+        // 首先尝试推荐的配置
+        const options = getRecordingOptions(config)
+        mediaRecorder = new MediaRecorder(stream, options)
+      } catch (optionsError) {
+        console.warn('Preferred MediaRecorder options failed, trying fallback:', optionsError)
+
+        try {
+          // 尝试基本配置
+          mediaRecorder = new MediaRecorder(stream, {
+            mimeType: 'audio/webm;codecs=opus'
+          })
+        } catch (webmError) {
+          console.warn('WebM format failed, trying MP4:', webmError)
+
+          try {
+            // 尝试MP4格式
+            mediaRecorder = new MediaRecorder(stream, {
+              mimeType: 'audio/mp4'
+            })
+          } catch (mp4Error) {
+            console.warn('MP4 format failed, using default:', mp4Error)
+
+            // 最后使用默认配置
+            mediaRecorder = new MediaRecorder(stream)
+          }
+        }
+      }
+
       mediaRecorderRef.current = mediaRecorder
       chunksRef.current = []
 
@@ -202,13 +254,13 @@ export function useVoiceRecorder(config: VoiceConfig): UseVoiceRecorderReturn {
       timerRef.current = setInterval(() => {
         setState(prev => {
           const newDuration = prev.duration + 1
-          
+
           // 检查是否达到最大时长
           if (newDuration >= config.maxDuration) {
             stopRecording()
             return { ...prev, duration: config.maxDuration }
           }
-          
+
           return { ...prev, duration: newDuration }
         })
       }, 1000)
@@ -351,18 +403,18 @@ export function getRecordingStateDescription(state: VoiceRecordingState): string
   if (state.error) {
     return state.error
   }
-  
+
   if (state.isProcessing) {
     return '正在处理录音...'
   }
-  
+
   if (state.isRecording) {
     return `录音中 ${formatDuration(state.duration)}`
   }
-  
+
   if (state.isReady) {
     return '准备就绪'
   }
-  
+
   return '点击开始录音'
 }

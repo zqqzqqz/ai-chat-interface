@@ -124,7 +124,7 @@ export function getConfigStatus(config: VoiceConfig): {
 } {
   const errors = validateVoiceConfig(config)
   const isComplete = isConfigComplete(config)
-  
+
   return {
     isComplete,
     isEnabled: config.enabled && isComplete,
@@ -170,13 +170,27 @@ export function mergeConfigs(...configs: Partial<VoiceConfig>[]): VoiceConfig {
 export function checkBrowserSupport(): {
   isSupported: boolean
   missingFeatures: string[]
+  browserInfo: {
+    name: string
+    version: string
+    platform: string
+    isMobile: boolean
+  }
 } {
   const missingFeatures: string[] = []
 
+  // 获取浏览器信息
+  const browserInfo = getBrowserInfo()
+
   if (typeof window === 'undefined') {
-    return { isSupported: false, missingFeatures: ['Window object'] }
+    return {
+      isSupported: false,
+      missingFeatures: ['Window object'],
+      browserInfo
+    }
   }
 
+  // 检查基础API支持
   if (!navigator.mediaDevices) {
     missingFeatures.push('MediaDevices API')
   }
@@ -193,10 +207,127 @@ export function checkBrowserSupport(): {
     missingFeatures.push('AudioContext API')
   }
 
-  return {
-    isSupported: missingFeatures.length === 0,
-    missingFeatures,
+  // 检查HTTPS要求（除了localhost）
+  if (typeof location !== 'undefined' &&
+      location.protocol !== 'https:' &&
+      !location.hostname.includes('localhost') &&
+      location.hostname !== '127.0.0.1') {
+    missingFeatures.push('HTTPS Protocol (required for microphone access)')
   }
+
+  // 特定浏览器的兼容性检查
+  const isSupported = checkBrowserCompatibility(browserInfo, missingFeatures)
+
+  return {
+    isSupported: isSupported && missingFeatures.length === 0,
+    missingFeatures,
+    browserInfo,
+  }
+}
+
+/**
+ * 获取浏览器信息
+ */
+function getBrowserInfo(): {
+  name: string
+  version: string
+  platform: string
+  isMobile: boolean
+} {
+  if (typeof navigator === 'undefined') {
+    return {
+      name: 'Unknown',
+      version: 'Unknown',
+      platform: 'Unknown',
+      isMobile: false
+    }
+  }
+
+  const userAgent = navigator.userAgent
+  const platform = navigator.platform || 'Unknown'
+  const isMobile = /iPhone|iPad|iPod|Android|BlackBerry|IEMobile|Opera Mini/i.test(userAgent)
+
+  let name = 'Unknown'
+  let version = 'Unknown'
+
+  // 检测浏览器类型和版本
+  if (userAgent.includes('Firefox')) {
+    name = 'Firefox'
+    const match = userAgent.match(/Firefox\/(\d+\.\d+)/)
+    version = match ? match[1] : 'Unknown'
+  } else if (userAgent.includes('Chrome') && !userAgent.includes('Edg')) {
+    name = 'Chrome'
+    const match = userAgent.match(/Chrome\/(\d+\.\d+)/)
+    version = match ? match[1] : 'Unknown'
+  } else if (userAgent.includes('Safari') && !userAgent.includes('Chrome')) {
+    name = 'Safari'
+    const match = userAgent.match(/Version\/(\d+\.\d+)/)
+    version = match ? match[1] : 'Unknown'
+  } else if (userAgent.includes('Edg')) {
+    name = 'Edge'
+    const match = userAgent.match(/Edg\/(\d+\.\d+)/)
+    version = match ? match[1] : 'Unknown'
+  }
+
+  return { name, version, platform, isMobile }
+}
+
+/**
+ * 检查特定浏览器的兼容性
+ */
+function checkBrowserCompatibility(
+  browserInfo: { name: string; version: string; isMobile: boolean },
+  missingFeatures: string[]
+): boolean {
+  const { name, version, isMobile } = browserInfo
+
+  // Firefox特殊处理
+  if (name === 'Firefox') {
+    const versionNum = parseFloat(version)
+    if (versionNum < 29) {
+      missingFeatures.push('Firefox version too old (requires 29+)')
+      return false
+    }
+    // Firefox在某些情况下Permissions API支持有限，但getUserMedia工作正常
+    return true
+  }
+
+  // Chrome特殊处理
+  if (name === 'Chrome') {
+    const versionNum = parseFloat(version)
+    if (versionNum < 47) {
+      missingFeatures.push('Chrome version too old (requires 47+)')
+      return false
+    }
+    return true
+  }
+
+  // Safari特殊处理
+  if (name === 'Safari') {
+    const versionNum = parseFloat(version)
+    if (isMobile && versionNum < 11) {
+      missingFeatures.push('Safari iOS version too old (requires 11+)')
+      return false
+    }
+    if (!isMobile && versionNum < 11) {
+      missingFeatures.push('Safari macOS version too old (requires 11+)')
+      return false
+    }
+    return true
+  }
+
+  // Edge特殊处理
+  if (name === 'Edge') {
+    const versionNum = parseFloat(version)
+    if (versionNum < 79) {
+      missingFeatures.push('Edge version too old (requires 79+)')
+      return false
+    }
+    return true
+  }
+
+  // 其他浏览器默认支持
+  return true
 }
 
 /**
@@ -224,7 +355,7 @@ export function getSupportedFormats(): string[] {
  */
 export function getBestAudioFormat(): string {
   const supportedFormats = getSupportedFormats()
-  
+
   // 优先级顺序：Opus > WebM > MP4 > WAV > OGG
   const preferredFormats = [
     'audio/webm;codecs=opus',
@@ -249,14 +380,24 @@ export function getBestAudioFormat(): string {
  */
 export function getRecordingOptions(config: VoiceConfig): MediaRecorderOptions {
   const format = getBestAudioFormat()
-  
+
   const options: MediaRecorderOptions = {
     mimeType: format,
   }
 
-  // 如果支持比特率设置
-  if (format.includes('opus') || format.includes('webm')) {
-    options.audioBitsPerSecond = 128000 // 128kbps
+  // 只在支持的情况下设置比特率，并进行跨平台兼容性检查
+  try {
+    if (MediaRecorder.isTypeSupported(format)) {
+      // 根据格式设置合适的比特率
+      if (format.includes('opus') || format.includes('webm')) {
+        options.audioBitsPerSecond = Math.min(config.sampleRate * 8, 128000) // 限制最大比特率
+      } else if (format.includes('mp4')) {
+        options.audioBitsPerSecond = Math.min(config.sampleRate * 6, 96000)
+      }
+      // WAV和OGG格式通常不需要设置比特率
+    }
+  } catch (error) {
+    console.warn('Failed to set audio bitrate, using default:', error)
   }
 
   return options
@@ -272,7 +413,7 @@ export function exportConfig(config: VoiceConfig): string {
     apiKey: config.apiKey ? '***' : '',
     exportedAt: new Date().toISOString(),
   }
-  
+
   return JSON.stringify(exportData, null, 2)
 }
 
@@ -283,11 +424,11 @@ export function importConfig(jsonString: string): VoiceConfig {
   try {
     const imported = JSON.parse(jsonString)
     const errors = validateVoiceConfig(imported)
-    
+
     if (errors.length > 0) {
       throw new Error(`配置验证失败: ${errors.join(', ')}`)
     }
-    
+
     return { ...DEFAULT_CONFIG, ...imported }
   } catch (error) {
     throw new Error(`配置导入失败: ${error instanceof Error ? error.message : '未知错误'}`)

@@ -4,10 +4,10 @@
  */
 
 import { useState, useEffect, useCallback } from 'react'
-import { 
-  VoicePermission, 
-  VoicePermissionState, 
-  UseVoicePermissionReturn 
+import {
+  VoicePermission,
+  VoicePermissionState,
+  UseVoicePermissionReturn
 } from '@/types/voice'
 import { checkBrowserSupport } from '@/lib/voice/config'
 
@@ -48,7 +48,7 @@ export function useVoicePermission(): UseVoicePermissionReturn {
       if (navigator.permissions && navigator.permissions.query) {
         try {
           const result = await navigator.permissions.query({ name: 'microphone' as PermissionName })
-          
+
           switch (result.state) {
             case 'granted':
               return 'granted'
@@ -60,26 +60,55 @@ export function useVoicePermission(): UseVoicePermissionReturn {
               return 'unknown'
           }
         } catch (error) {
-          // Permissions API 可能不支持 microphone 查询
-          console.warn('Permissions API query failed:', error)
+          // Permissions API 可能不支持 microphone 查询（特别是Firefox）
+          console.warn('Permissions API query failed, falling back to getUserMedia test:', error)
         }
       }
 
-      // 如果 Permissions API 不可用，尝试通过 getUserMedia 检查
+      // 如果 Permissions API 不可用或失败，尝试通过 getUserMedia 检查
+      // 这是Firefox等浏览器的兼容性处理
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: true,
-          video: false 
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          },
+          video: false
         })
-        
+
         // 立即停止流
         stream.getTracks().forEach(track => track.stop())
         return 'granted'
       } catch (error: any) {
-        if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-          return 'denied'
+        console.warn('getUserMedia test failed:', error)
+
+        // 更详细的错误处理，特别针对Firefox
+        switch (error.name) {
+          case 'NotAllowedError':
+          case 'PermissionDeniedError':
+            return 'denied'
+          case 'NotFoundError':
+            // 没有找到麦克风设备
+            return 'denied'
+          case 'NotReadableError':
+            // 设备被其他应用占用
+            return 'prompt'
+          case 'OverconstrainedError':
+            // 约束条件无法满足，尝试更宽松的条件
+            try {
+              const fallbackStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+              fallbackStream.getTracks().forEach(track => track.stop())
+              return 'granted'
+            } catch (fallbackError) {
+              return 'prompt'
+            }
+          case 'SecurityError':
+            // HTTPS要求或其他安全限制
+            return 'denied'
+          default:
+            return 'prompt'
         }
-        return 'prompt'
       }
     } catch (error) {
       console.warn('Permission check failed:', error)
@@ -107,40 +136,90 @@ export function useVoicePermission(): UseVoicePermissionReturn {
     }
 
     try {
-      // 请求麦克风权限
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: true,
-        video: false 
-      })
-      
+      // 请求麦克风权限，使用渐进式降级策略
+      let stream: MediaStream | null = null
+
+      try {
+        // 首先尝试高质量配置
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            sampleRate: 16000,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false
+        })
+      } catch (constraintError) {
+        console.warn('High-quality audio constraints failed, trying basic:', constraintError)
+
+        // 如果高质量配置失败，尝试基本配置
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: false
+          })
+        } catch (basicError) {
+          console.warn('Basic audio request failed:', basicError)
+          throw basicError
+        }
+      }
+
       // 立即停止流
-      stream.getTracks().forEach(track => track.stop())
-      
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop())
+      }
+
       const newState: VoicePermissionState = 'granted'
       setPermission(prev => ({
         ...prev,
         state: newState,
         canRequest: false,
       }))
-      
+
       return newState
     } catch (error: any) {
+      console.warn('Permission request failed:', error)
+
       let newState: VoicePermissionState = 'unknown'
-      
-      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-        newState = 'denied'
-      } else if (error.name === 'NotFoundError') {
-        newState = 'denied' // 没有设备也算拒绝
-      } else {
-        newState = 'prompt'
+
+      // 详细的错误处理，特别针对不同浏览器
+      switch (error.name) {
+        case 'NotAllowedError':
+        case 'PermissionDeniedError':
+          newState = 'denied'
+          break
+        case 'NotFoundError':
+          // 没有找到麦克风设备
+          newState = 'denied'
+          break
+        case 'NotReadableError':
+          // 设备被其他应用占用
+          newState = 'prompt'
+          break
+        case 'OverconstrainedError':
+          // 约束条件无法满足
+          newState = 'prompt'
+          break
+        case 'SecurityError':
+          // HTTPS要求或其他安全限制
+          newState = 'denied'
+          break
+        case 'AbortError':
+          // 用户取消或超时
+          newState = 'prompt'
+          break
+        default:
+          newState = 'prompt'
       }
-      
+
       setPermission(prev => ({
         ...prev,
         state: newState,
         canRequest: newState === 'prompt',
       }))
-      
+
       return newState
     }
   }, [checkSupport])
@@ -157,10 +236,10 @@ export function useVoicePermission(): UseVoicePermissionReturn {
       }
 
       try {
-        permissionStatus = await navigator.permissions.query({ 
-          name: 'microphone' as PermissionName 
+        permissionStatus = await navigator.permissions.query({
+          name: 'microphone' as PermissionName
         })
-        
+
         const handlePermissionChange = () => {
           if (permissionStatus) {
             setPermission(prev => ({
@@ -172,7 +251,7 @@ export function useVoicePermission(): UseVoicePermissionReturn {
         }
 
         permissionStatus.addEventListener('change', handlePermissionChange)
-        
+
         // 初始状态设置
         handlePermissionChange()
       } catch (error) {
@@ -197,7 +276,7 @@ export function useVoicePermission(): UseVoicePermissionReturn {
     const initializePermission = async () => {
       const isSupported = checkSupport()
       const state = await checkPermission()
-      
+
       setPermission({
         state,
         isSupported,
@@ -237,21 +316,21 @@ export function getPermissionDescription(state: VoicePermissionState): {
         title: '麦克风权限已授予',
         description: '您可以使用语音输入功能',
       }
-    
+
     case 'denied':
       return {
         title: '麦克风权限被拒绝',
         description: '请在浏览器设置中允许访问麦克风',
         action: '前往设置',
       }
-    
+
     case 'prompt':
       return {
         title: '需要麦克风权限',
         description: '点击下方按钮授予麦克风访问权限',
         action: '授予权限',
       }
-    
+
     case 'unknown':
     default:
       return {
@@ -269,9 +348,9 @@ export function getPermissionGuide(): {
   title: string
   steps: string[]
 } {
-  const isMobile = typeof navigator !== 'undefined' && 
+  const isMobile = typeof navigator !== 'undefined' &&
     /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
-  
+
   if (isMobile) {
     return {
       title: '移动端权限设置',
